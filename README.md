@@ -33,6 +33,15 @@ Now, use Once to wrap a call that you want done uniquely
 The combination of the name and params makes the check unique. So typically it would be the
 command you're executing, plus the params to that command
 
+## Notes
+
+This does not implement an atomic lock, nor does it take into account
+distributed locks across a cluster. This is more of a simple "probably
+guarantee uniqueness" implementation used to guard against things happening
+multiple times within minutes/hours/days, not milliseconds.
+
+See: [redlock](https://github.com/antirez/redlock-rb) for an example of distributed locking.
+
 ## Contributing
 
 1. Fork it
