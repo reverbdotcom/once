@@ -41,8 +41,7 @@ module Once
         block.call
       end
 
-      redis.set(redis_key, true)
-      redis.expire(redis_key, within)
+      redis.setex(redis_key, within, true)
     end
   end
 end
