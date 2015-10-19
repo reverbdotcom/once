@@ -13,7 +13,7 @@ require 'digest'
 #     .. stuff that should happen only once ..
 #   end
 #
-# The combination of the name and params makes the check unique. So typically it would be the 
+# The combination of the name and params makes the check unique. So typically it would be the
 # command you're executing, plus the params to that command
 module Once
   DEFAULT_TIME = 3600 # seconds
@@ -37,11 +37,17 @@ module Once
       hash = Digest::MD5.hexdigest(params.inspect)
       redis_key = "uniquecheck:#{name}:#{hash}"
 
+      perform(redis_key, &block).tap do
+        redis.setex(redis_key, within, true)
+      end
+    end
+
+    private
+
+    def perform(redis_key, &block)
       unless redis.exists(redis_key)
         block.call
       end
-
-      redis.setex(redis_key, within, true)
     end
   end
 end

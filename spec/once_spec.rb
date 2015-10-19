@@ -8,7 +8,7 @@ describe Once do
     Once.redis = Redis.new
   end
 
-  let(:thing_to_execute)  { double(execute: nil) }
+  let(:thing_to_execute)  { double(execute: "foo") }
   let(:params) {{foo: "bar"}}
 
   it "executes the given command" do
@@ -17,6 +17,12 @@ describe Once do
     end
 
     thing_to_execute.should have_received(:execute).once
+  end
+
+  it "returns the result of the command" do
+    described_class.do(name: "mycheck", params: params) do
+      thing_to_execute.execute
+    end.should == "foo"
   end
 
   it "executes when called from within different namespaces" do
