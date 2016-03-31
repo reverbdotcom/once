@@ -37,15 +37,7 @@ module Once
       hash = Digest::MD5.hexdigest(params.inspect)
       redis_key = "uniquecheck:#{name}:#{hash}"
 
-      perform(redis_key, &block).tap do
-        redis.setex(redis_key, within, true)
-      end
-    end
-
-    private
-
-    def perform(redis_key, &block)
-      unless redis.exists(redis_key)
+      if redis.set(redis_key, true, ex: within, nx: true)
         block.call
       end
     end
