@@ -1,3 +1,6 @@
+## 0.0.4
+* Fully atomic using setnx
+
 ## 0.0.3
 * Atomic setex insted of set and expire commands individually
 * Return results of the executed block
