@@ -34,12 +34,29 @@ module Once
     # name: The name of the check, used as a namespace
     # params: The params that will control whether or not the body executes
     def do(name:, params:, within: DEFAULT_TIME, &block)
-      hash = Digest::MD5.hexdigest(params.inspect)
-      redis_key = "uniquecheck:#{name}:#{hash}"
+      redis_key = redis_key(name: name, params: params)
 
       if redis.set(redis_key, true, ex: within, nx: true)
         block.call
       end
     end
+
+    def key_in_use?(name:, params:)
+      ttl_seconds(name: name, params: params) > 0
+    end
+
+    def ttl_seconds(name:, params:)
+      redis_key = redis_key(name: name, params: params)
+
+      redis.ttl(redis_key)
+    end
+
+    private
+
+    def redis_key(name:, params:)
+      hash = Digest::MD5.hexdigest(params.inspect)
+      "uniquecheck:#{name}:#{hash}"
+    end
+
   end
 end
