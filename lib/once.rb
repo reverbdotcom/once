@@ -41,5 +41,16 @@ module Once
         block.call
       end
     end
+
+    def key_in_use?(name:, params:)
+      ttl_seconds(name: name, params: params) > 0
+    end
+
+    def ttl_seconds(name:, params:)
+      hash = Digest::MD5.hexdigest(params.inspect)
+      redis_key = "uniquecheck:#{name}:#{hash}"
+
+      redis.ttl(redis_key)
+    end
   end
 end
