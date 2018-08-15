@@ -90,4 +90,18 @@ describe Once do
 
     thing_to_execute.should have_received(:execute).twice
   end
+
+  it "expires the key immediately if an exception is raised" do
+    2.times do
+      begin
+        described_class.do(name: "mycheck", params: {foo: "bar"}) do
+          thing_to_execute.execute
+          raise "BOOM"
+        end
+      rescue
+      end
+    end
+
+    thing_to_execute.should have_received(:execute).twice
+  end
 end

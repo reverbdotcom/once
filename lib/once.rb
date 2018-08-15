@@ -38,7 +38,12 @@ module Once
       redis_key = "uniquecheck:#{name}:#{hash}"
 
       if redis.set(redis_key, true, ex: within, nx: true)
-        block.call
+        begin
+          block.call
+        rescue
+          redis.expire(redis_key, 0)
+          raise
+        end
       end
     end
   end
