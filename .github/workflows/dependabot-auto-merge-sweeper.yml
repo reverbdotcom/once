@@ -1,0 +1,275 @@
+# Dependabot auto-merge SWEEPER (scheduled backstop).
+# Copy to .github/workflows/dependabot-auto-merge-sweeper.yml alongside the
+# per-PR workflow (auto-merge-no-ci.yml or auto-merge-required-review.yml).
+# This does NOT replace the per-PR workflow; it catches what that one misses.
+#
+# WHY THIS EXISTS (found 2026-09-11 on go-links):
+# The per-PR workflow is driven by the pull_request_target event and serialized
+# with a `concurrency` group. `cancel-in-progress: false` protects the run that
+# is already executing, but GitHub keeps only ONE running + ONE pending run per
+# concurrency group and CANCELS any queued run beyond that. So an onboarding
+# burst (8 Dependabot PRs in ~30s) silently drops the middle of the queue. On
+# go-links, docker/setup-buildx-action 4.0.0 -> 4.3.0 (a clean minor) sat open
+# for 17 days because its run was cancelled, not because it was held.
+# Event-driven serialization cannot be made burst-safe. A scheduled sweep can.
+#
+# It also mops up two other known cases for free:
+#   - PRs that predate the workflow install (they never fired the event at all)
+#   - multi-dependency / lockfile-only PRs the title fallback cannot classify
+#
+# SAFETY: same merge policy as the per-PR workflow (patch/minor only, majors
+# held), just evaluated on a cadence instead of on an event. It only ever
+# touches PRs authored by dependabot[bot]. Start with dry_run to see what it
+# would take before letting it merge anything.
+name: Dependabot auto-merge sweeper
+
+on:
+  schedule:
+    # Every 6 hours. Frequent enough that a dropped run is corrected the same
+    # day; infrequent enough to stay well clear of API limits.
+    - cron: "17 */6 * * *"
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: "List what would be merged without merging"
+        type: boolean
+        default: true
+
+permissions:
+  contents: write
+  pull-requests: write
+
+# Never let two sweeps run at once, and never let a sweep race the per-PR
+# workflow. Sharing the per-PR group name is deliberate: it means a sweep and
+# an event-driven merge serialize against each other rather than both pushing
+# into a moving main. Queue-drop is harmless here because the next scheduled
+# sweep re-evaluates everything anyway, which is the whole point.
+concurrency:
+  group: dependabot-auto-merge-${{ github.repository }}
+  cancel-in-progress: false
+
+jobs:
+  sweep:
+    runs-on: ubuntu-latest
+    env:
+      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      REPO: ${{ github.repository }}
+      # Match the per-PR workflow for this repo: "squash" for non-CI repos,
+      # "merge" for repos whose ruleset requires merge commits (reverb-tracecat).
+      MERGE_METHOD: squash
+      # Set to "true" ONLY on repos running the required-review auto-approve
+      # variant (reverb-tracecat, security-tools, cloud-custodian). Approving
+      # with GITHUB_TOKEN satisfies a plain review requirement; it does NOT
+      # satisfy a code-owner review requirement.
+      APPROVE_FIRST: "false"
+      # "true" on CI-GATED repos, which must match auto-merge-ci.yml and hand the
+      # merge to GitHub's queue with --auto so it lands only on green required
+      # checks. "false" on non-CI repos, where the whole point is merging on
+      # arrival with no verification.
+      #
+      # Getting this wrong on a CI-gated repo is the one way this workflow can do
+      # real damage: an immediate `gh pr merge` there bypasses the required check
+      # the repo was deliberately gated on. Set it when you install, not later.
+      USE_AUTO_MERGE: "false"
+      DRY_RUN: ${{ github.event_name == 'workflow_dispatch' && inputs.dry_run || 'false' }}
+    steps:
+      - name: Sweep open Dependabot PRs
+        run: |
+          set -uo pipefail
+
+          # --- classify: is every version pair in this PR same-major? ---------
+          # Dependabot's commit body carries per-dependency version pairs in two
+          # shapes, and a PR can contain several of them:
+          #   "Bumps [name](url) from 1.2.3 to 1.2.9."      (single dep)
+          #   "Updates \`name\` from 4.21.2 to 5.2.1"        (multi dep / ancestor)
+          # This is strictly better than parsing the PR TITLE, because a title
+          # like "Bump qs and express" carries no versions at all while its body
+          # reveals express 4.21.2 -> 5.2.1, a major that must be held. The
+          # `update-type:` trailer is NOT reliable here: Dependabot omits it for
+          # indirect and ancestor updates, which is the same reason
+          # dependabot/fetch-metadata returns nothing for those PRs.
+          classify() {
+            local body="$1" pairs old new
+            pairs=$(printf '%s\n' "$body" | grep -oE '(Bumps \[?[^]]*\]?\([^)]*\)|Bumps [^ ]+|Updates `[^`]*`) from [0-9][0-9A-Za-z.-]* to [0-9][0-9A-Za-z.-]*' \
+                    | grep -oE 'from [0-9][0-9A-Za-z.-]* to [0-9][0-9A-Za-z.-]*')
+            # No parseable pair at all: hold. Never merge what we cannot read.
+            [ -z "$pairs" ] && { echo "hold:unparseable"; return; }
+            while read -r _ old _ new; do
+              [ -z "${old:-}" ] && continue
+              # Sentence-ending period rides along on single-dep bodies
+              # ("... from 4.0.0 to 4.3.0."). Harmless to the comparison, ugly
+              # in the log line.
+              new="${new%.}"
+              # Major must match.
+              if [ "${old%%.*}" != "${new%%.*}" ]; then
+                echo "hold:major ${old}->${new}"; return
+              fi
+              # 0.x is not semver-stable: 0.1.x -> 0.2.x is a breaking change
+              # even though the major matches. Require the minor to match too.
+              # (The per-PR template compares only the major and therefore treats
+              # these as safe; that is the known 0.x fragile case in the runbook.
+              # Worth backporting this rule there.)
+              if [ "${old%%.*}" = "0" ]; then
+                local om="${old#*.}" nm="${new#*.}"
+                if [ "${om%%.*}" != "${nm%%.*}" ]; then
+                  echo "hold:zerover ${old}->${new}"; return
+                fi
+              fi
+            done <<< "$pairs"
+            echo "merge"
+          }
+
+          # --- collect open Dependabot PRs ------------------------------------
+          # Filter on the PR AUTHOR via the API rather than `gh pr list --author`,
+          # so a human commenting on or labeling the PR cannot change the answer.
+          #
+          # This script deliberately does NOT run `set -e` (a non-zero `gh` call
+          # in the merge loop must not abort the whole sweep), so this call's
+          # status has to be checked by hand. Without that, a transient API
+          # failure yields an empty list, falls through to the "nothing to sweep"
+          # path, and reports SUCCESS — the backstop silently skipping every PR
+          # and hiding the outage until the next run six hours later. For a
+          # workflow whose entire job is to not fail quietly, that is the worst
+          # available behaviour, so fail loudly instead.
+          if ! prs=$(gh api "repos/$REPO/pulls?state=open&per_page=100" --paginate \
+                  --jq '.[] | select(.user.login=="dependabot[bot]") | .number'); then
+            echo "::error::Could not list open PRs for $REPO. Failing rather than"
+            echo "::error::reporting an empty sweep, which would look like success."
+            exit 1
+          fi
+
+          if [ -z "$prs" ]; then
+            echo "No open Dependabot PRs. Nothing to sweep."
+            exit 0
+          fi
+
+          merged=0; held=0; failed=0
+          skipped=0
+          for n in $prs; do
+            title=$(gh api "repos/$REPO/pulls/$n" --jq '.title')
+
+            # Classify against EVERY commit on the PR, not just the first.
+            # Two reasons. A Dependabot PR can carry more than one commit, so
+            # reading `.[0]` alone can miss a version pair — including a major —
+            # that lives in a later commit, and merge on an incomplete picture.
+            # And the author gate above is on the PULL REQUEST author, which
+            # stays dependabot[bot] even if someone pushes their own commit to
+            # the branch; classifying the whole set means such a commit cannot
+            # hide a bump from the verdict.
+            if ! commits=$(gh api "repos/$REPO/pulls/$n/commits" --paginate \
+                    --jq '.[] | .commit.message'); then
+              echo "FAILED  #$n (could not read commits) $title"
+              failed=$((failed+1)); continue
+            fi
+            verdict=$(classify "$commits")
+
+            # Belt and braces on the same hole: if any commit on the branch was
+            # not authored by Dependabot, a human has touched it. Hold it for
+            # review regardless of how the versions classify — the classifier
+            # only reads version numbers and cannot vouch for arbitrary code.
+            non_bot=$(gh api "repos/$REPO/pulls/$n/commits" --paginate \
+                        --jq '[.[] | select(.author.login != "dependabot[bot]")] | length' 2>/dev/null || echo "unknown")
+            if [ "$non_bot" != "0" ]; then
+              echo "HOLD    #$n (has non-Dependabot commits: $non_bot) $title"
+              held=$((held+1)); continue
+            fi
+
+            if [ "${verdict%%:*}" != "merge" ]; then
+              echo "HOLD    #$n ($verdict) $title"
+              held=$((held+1))
+              continue
+            fi
+
+            # --- mergeability guard -------------------------------------------
+            # A sweeper sees PRs the per-PR workflow never would: ones left
+            # behind by a config change or superseded by a grouped PR that
+            # already applied the same bump. Those go `dirty` (conflicted), and
+            # attempting them just burns the retry budget on something that can
+            # never merge. Real example: hiring-calculator #4/#5/#6 were
+            # obsolete duplicates of a grouped minor-patch merge, all `dirty`.
+            # GitHub computes `mergeable` lazily, so `null`/unknown means "ask
+            # again in a moment", not "not mergeable".
+            state=""
+            for probe in 1 2 3; do
+              state=$(gh api "repos/$REPO/pulls/$n" --jq '.mergeable_state')
+              [ "$state" != "unknown" ] && break
+              sleep 5
+            done
+            case "$state" in
+              behind|clean|unstable|has_hooks)
+                # `behind` means the branch trails the base but still merges
+                # cleanly, which is the normal state for a Dependabot PR on an
+                # active repo. Skipping it would make the sweeper a no-op on
+                # exactly the repos that need it. (Adopted from the Copilot
+                # Autofix suggestion on security-policies#15.) A repo with
+                # "require branches up to date" will refuse the merge anyway,
+                # and that surfaces as a normal non-transient failure.
+                : ;;                     # fine to proceed
+              dirty)
+                echo "SKIP    #$n (conflicted; likely superseded, needs closing not merging) $title"
+                skipped=$((skipped+1)); continue ;;
+              blocked)
+                # On a CI-gated repo this is the NORMAL state while required
+                # checks are pending or a review is outstanding, and --auto
+                # exists precisely to wait it out. Only skip when we would be
+                # merging immediately, where blocked means it cannot land.
+                if [ "$USE_AUTO_MERGE" = "true" ] || [ "$APPROVE_FIRST" = "true" ]; then
+                  : # proceed; --auto queues it, or the approve step clears the review
+                else
+                  echo "SKIP    #$n (blocked by branch protection) $title"
+                  skipped=$((skipped+1)); continue
+                fi ;;
+              draft)
+                echo "SKIP    #$n (draft) $title"
+                skipped=$((skipped+1)); continue ;;
+              *)
+                echo "SKIP    #$n (mergeable_state=$state) $title"
+                skipped=$((skipped+1)); continue ;;
+            esac
+
+            if [ "$DRY_RUN" = "true" ]; then
+              echo "WOULD   #$n $title"
+              merged=$((merged+1))
+              continue
+            fi
+
+            if [ "$APPROVE_FIRST" = "true" ]; then
+              # Already-approved PRs make this a no-op failure; ignore that.
+              gh pr review "$n" --repo "$REPO" --approve >/dev/null 2>&1 || true
+            fi
+
+            # On a CI-gated repo, --auto hands the merge to GitHub's queue, which
+            # holds it until the required checks pass and re-evaluates when the
+            # base moves. Never merge immediately there: it would bypass the
+            # check the repo is gated on. The retry loop below is a no-op in this
+            # mode, since --auto returns as soon as it is armed.
+            auto_flag=""
+            [ "$USE_AUTO_MERGE" = "true" ] && auto_flag="--auto"
+
+            ok=false
+            for attempt in 1 2 3 4 5; do
+              if out=$(gh pr merge "$n" --repo "$REPO" $auto_flag "--$MERGE_METHOD" 2>&1); then
+                if [ -n "$auto_flag" ]; then
+                  echo "ARMED   #$n (auto-merge on green CI) $title"
+                else
+                  echo "MERGED  #$n (attempt $attempt) $title"
+                fi
+                ok=true; break
+              fi
+              # Retry ONLY the transient base-moved race, same rule as the
+              # per-PR workflow. A real conflict will never clear by waiting.
+              if echo "$out" | grep -q "Base branch was modified"; then
+                sleep $((attempt * 10)); continue
+              fi
+              echo "FAILED  #$n $title"
+              echo "        $out"
+              break
+            done
+            if [ "$ok" = true ]; then merged=$((merged+1)); else failed=$((failed+1)); fi
+          done
+
+          echo
+          echo "sweep summary: merged=$merged held=$held skipped=$skipped failed=$failed (dry_run=$DRY_RUN)"
+          # A held PR is a correct outcome, not an error. Only a failed merge
+          # attempt should colour the run, and even then the next sweep retries.
+          [ "$failed" -eq 0 ]
