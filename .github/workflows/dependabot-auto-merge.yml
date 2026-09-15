@@ -1,0 +1,88 @@
+# Dependabot auto-merge for NON-CI repos (no PR CI, no branch protection).
+# Copy to .github/workflows/dependabot-auto-merge.yml in a target repo that has
+# no required checks to gate on.
+#
+# Patch/minor Dependabot PRs merge IMMEDIATELY on arrival, with NO verification.
+# Majors are held for a human. This is a deliberate trade for low-blast-radius
+# internal tooling only. Do NOT use on anything deployed or customer-facing.
+# Add a README line on the repo noting bumps merge without CI, on purpose.
+#
+# BURST-RACE FIX (required on non-CI repos): the first run on a repo with a
+# backlog opens several PRs at once, and immediate `gh pr merge --squash` calls
+# race into a moving main. The losers fail with "Base branch was modified" and
+# sit open looking stuck. The `concurrency` group serializes merges so they
+# don't race; the retry loop is the backstop, and it retries ONLY that
+# transient signature (a real conflict is not retryable). CI-gated repos do NOT
+# need this (--auto hands the merge to GitHub's queue); see templates/auto-merge-ci.yml.
+#
+# To upgrade to gated auto-merge later: add a CI workflow, require it on the
+# default branch, and switch to templates/auto-merge-ci.yml (uses --auto).
+name: Dependabot auto-merge
+
+on: pull_request_target
+
+permissions:
+  contents: write
+  pull-requests: write
+
+# Serialize auto-merges for this repo so parallel Dependabot PRs don't race
+# into a moving main. cancel-in-progress: false = let each finish, don't drop any.
+concurrency:
+  group: dependabot-auto-merge-${{ github.repository }}
+  cancel-in-progress: false
+
+jobs:
+  auto-merge:
+    # Gate on the PR AUTHOR, not github.actor: a human re-running the job or
+    # editing/labeling the PR changes github.actor and would skip an eligible
+    # patch/minor PR. The author stays dependabot[bot].
+    if: github.event.pull_request.user.login == 'dependabot[bot]'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Fetch Dependabot metadata
+        id: meta
+        # Pinned to a commit SHA (supply-chain hardening); Dependabot's
+        # github-actions ecosystem keeps this pin current.
+        uses: dependabot/fetch-metadata@25dd0e34f4fe68f24cc83900b1fe3fe149efef98 # v3.1.0
+        with:
+          github-token: "${{ secrets.GITHUB_TOKEN }}"
+
+      - name: Classify bump (metadata, then title fallback)
+        id: bump
+        env:
+          UT: ${{ steps.meta.outputs.update-type }}
+          TITLE: ${{ github.event.pull_request.title }}
+        run: |
+          merge=false
+          case "$UT" in
+            version-update:semver-patch|version-update:semver-minor) merge=true ;;
+            version-update:semver-major) merge=false ;;
+            *)
+              if [[ "$TITLE" =~ from[[:space:]]+[^0-9]*([0-9][0-9A-Za-z.-]*)[[:space:]]+to[[:space:]]+[^0-9]*([0-9][0-9A-Za-z.-]*) ]]; then
+                old="${BASH_REMATCH[1]}"; new="${BASH_REMATCH[2]}"
+                [[ "${old%%.*}" == "${new%%.*}" ]] && merge=true
+              fi ;;
+          esac
+          echo "merge=$merge" >> "$GITHUB_OUTPUT"
+          echo "update-type='$UT' title='$TITLE' -> merge=$merge"
+
+      - name: Merge patch/minor immediately (retry only on base-moved race)
+        if: steps.bump.outputs.merge == 'true'
+        env:
+          PR_URL: ${{ github.event.pull_request.html_url }}
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          for attempt in 1 2 3 4 5; do
+            if out=$(gh pr merge --squash "$PR_URL" 2>&1); then
+              echo "merged on attempt $attempt"; exit 0
+            fi
+            echo "attempt $attempt failed: $out"
+            # Retry ONLY the transient base-moved race. Anything else (e.g. a
+            # real "cannot be cleanly created" conflict) will never clear by
+            # waiting, so fail fast instead of burning the backoff.
+            if echo "$out" | grep -q "Base branch was modified"; then
+              sleep $((attempt * 10)); continue
+            fi
+            echo "non-transient failure; not retrying"; exit 1
+          done
+          echo "still racing after 5 attempts; leaving for the next run"; exit 1
