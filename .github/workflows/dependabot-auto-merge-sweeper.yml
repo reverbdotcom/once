@@ -17,10 +17,11 @@
 #   - PRs that predate the workflow install (they never fired the event at all)
 #   - multi-dependency / lockfile-only PRs the title fallback cannot classify
 #
-# SAFETY: same merge policy as the per-PR workflow (patch/minor only, majors
-# held), just evaluated on a cadence instead of on an event. It only ever
-# touches PRs authored by dependabot[bot]. Start with dry_run to see what it
-# would take before letting it merge anything.
+# SAFETY: same merge policy as the per-PR workflow (patch/minor merge, majors
+# held, except github-actions majors when ALLOW_ACTIONS_MAJOR is set; see the
+# override below), just evaluated on a cadence instead of on an event. It only
+# ever touches PRs authored by dependabot[bot]. Start with dry_run to see what
+# it would take before letting it merge anything.
 name: Dependabot auto-merge sweeper
 
 on:
@@ -152,8 +153,41 @@ jobs:
 
           merged=0; held=0; failed=0
           skipped=0
+
+          # Disarm any auto-merge a previous per-PR run armed for a PR the sweep
+          # is now holding. The per-PR workflow disarms on a disqualifying
+          # synchronize, but that event can be dropped (the exact failure mode
+          # this sweeper exists to cover), so the backstop repeats it. Only on
+          # repos that arm auto-merge; the benign "nothing armed" result is
+          # ignored, a real failure is logged (the sweep avoids set -e).
+          disarm() {
+            [ "$USE_AUTO_MERGE" = "true" ] || return 0
+            # Query the armed state rather than parsing gh's no-op error phrasing,
+            # which varies ("not enabled", "not configured for auto merge", ...)
+            # and would otherwise count ordinary held PRs as failures. A PR with
+            # nothing armed is a no-op; a real failure to read the state or to
+            # disable counts toward $failed so the run fails loudly (without
+            # aborting the rest of the sweep).
+            local armed out
+            if ! armed=$(gh api "repos/$REPO/pulls/$1" --jq '.auto_merge != null' 2>&1); then
+              echo "FAILED  #$1 could not read auto-merge state: $armed"
+              failed=$((failed+1)); return 0
+            fi
+            [ "$armed" = "true" ] || return 0
+            if ! out=$(gh pr merge "$1" --repo "$REPO" --disable-auto 2>&1); then
+              echo "FAILED  #$1 could not disarm auto-merge: $out"
+              failed=$((failed+1))
+            fi
+          }
+
           for n in $prs; do
             title=$(gh api "repos/$REPO/pulls/$n" --jq '.title')
+            # Capture the head SHA now and pin the merge to it below, so the
+            # non-bot and changed-file guards are atomic with the merge: a commit
+            # pushed into the race window changes the head, the pinned merge is
+            # refused (a non-transient failure, not retried), and the next sweep
+            # re-evaluates from scratch.
+            head_sha=$(gh api "repos/$REPO/pulls/$n" --jq '.head.sha')
 
             # Classify against EVERY commit on the PR, not just the first.
             # Two reasons. A Dependabot PR can carry more than one commit, so
@@ -175,31 +209,55 @@ jobs:
             # review regardless of how the versions classify — the classifier
             # only reads version numbers and cannot vouch for arbitrary code.
             non_bot=$(gh api "repos/$REPO/pulls/$n/commits" --paginate \
-                        --jq '[.[] | select(.author.login != "dependabot[bot]")] | length' 2>/dev/null || echo "unknown")
+                        --jq '[.[] | select((.author.login != "dependabot[bot]") or (.committer.login != "dependabot[bot]"))] | length' 2>/dev/null || echo "unknown")
             if [ "$non_bot" != "0" ]; then
               echo "HOLD    #$n (has non-Dependabot commits: $non_bot) $title"
+              disarm "$n"
               held=$((held+1)); continue
             fi
 
             # github-actions major override: a bump that touches ONLY workflow or
             # composite-action DEFINITION files runs in CI and never ships. When
             # enabled for this repo, clear a hold:major (but NOT a hold:zerover or
-            # hold:unparseable) for such a PR. The allowlist is a .yml/.yaml file
-            # under .github/workflows/ or .github/actions/, and the extension
-            # check matters: a non-actions ecosystem can keep a manifest under
-            # those dirs (this repo has .github/actions/run-task/package-lock.json),
-            # and a path-prefix-only match would merge an npm major touching it as
-            # if it were a CI-only action bump. Pull a flat filename list across
-            # pages and count the non-action files in the shell; gh rejects --slurp
-            # together with --jq, so do NOT reach for it here. An empty or failed
-            # response leaves the PR held.
+            # hold:unparseable) for such a PR. Two independent gates, because the
+            # sweeper has no fetch-metadata and must not guess the ecosystem:
+            #   1. The head branch is dependabot/github_actions/*. Dependabot
+            #      encodes the ecosystem in the branch, so this rules out e.g. a
+            #      docker-ecosystem bump that edits a workflow's container image.
+            #   2. Every changed file is a .yml/.yaml under .github/workflows/ or
+            #      .github/actions/. The extension matters: a non-actions manifest
+            #      can sit beside a composite action (this repo has
+            #      .github/actions/run-task/package-lock.json), and a path-prefix
+            #      match alone would merge an npm major touching it.
+            # Pull a flat filename list across pages and count non-action files in
+            # the shell (gh rejects --slurp with --jq). The file list is captured
+            # inside `if changed=$(...)` so a FAILED or partial-then-failed
+            # pagination (gh exits non-zero) falls to "unknown" and holds, rather
+            # than deciding on an incomplete list.
             if [ "$ALLOW_ACTIONS_MAJOR" = "true" ] && [ "${verdict%% *}" = "hold:major" ]; then
-              changed=$(gh api "repos/$REPO/pulls/$n/files" --paginate --jq '.[].filename' 2>/dev/null)
-              if [ -z "$changed" ]; then
-                non_actions="unknown"
-              else
-                non_actions=$(printf '%s\n' "$changed" | grep -vcE '^\.github/(workflows|actions)/.*\.(ya?ml)$')
-              fi
+              head_ref=$(gh api "repos/$REPO/pulls/$n" --jq '.head.ref' 2>/dev/null || echo "")
+              non_actions="unknown"
+              case "$head_ref" in
+                dependabot/github_actions/*)
+                  if changed=$(gh api "repos/$REPO/pulls/$n/files" --paginate --jq '.[].filename' 2>/dev/null); then
+                    if [ -z "$changed" ]; then
+                      non_actions="unknown"
+                    else
+                      # Count non-action files with a pure-shell case loop, not
+                      # grep -vc: when every line matches, grep exits 1, and the
+                      # default Actions shell can be strict enough to abort the
+                      # step on that (killing exactly the actions-only case this
+                      # override is for). The loop has no such failure mode.
+                      non_actions=0
+                      while IFS= read -r f; do
+                        case "$f" in
+                          .github/workflows/*.yml|.github/workflows/*.yaml|.github/actions/*.yml|.github/actions/*.yaml) : ;;
+                          *) non_actions=$((non_actions+1)) ;;
+                        esac
+                      done <<< "$changed"
+                    fi
+                  fi ;;
+              esac
               if [ "$non_actions" = "0" ]; then
                 echo "OVERRIDE #$n (actions-only major; CI-gated by nature) $title"
                 verdict="merge"
@@ -208,6 +266,7 @@ jobs:
 
             if [ "${verdict%%:*}" != "merge" ]; then
               echo "HOLD    #$n ($verdict) $title"
+              disarm "$n"
               held=$((held+1))
               continue
             fi
@@ -280,7 +339,7 @@ jobs:
 
             ok=false
             for attempt in 1 2 3 4 5; do
-              if out=$(gh pr merge "$n" --repo "$REPO" $auto_flag "--$MERGE_METHOD" 2>&1); then
+              if out=$(gh pr merge "$n" --repo "$REPO" $auto_flag --match-head-commit "$head_sha" "--$MERGE_METHOD" 2>&1); then
                 if [ -n "$auto_flag" ]; then
                   echo "ARMED   #$n (auto-merge on green CI) $title"
                 else
