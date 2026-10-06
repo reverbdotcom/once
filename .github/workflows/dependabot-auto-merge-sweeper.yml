@@ -71,6 +71,13 @@ jobs:
       # real damage: an immediate `gh pr merge` there bypasses the required check
       # the repo was deliberately gated on. Set it when you install, not later.
       USE_AUTO_MERGE: "false"
+      # Also merge github-actions MAJOR bumps. Action bumps run only in CI, so a
+      # broken one fails the build and never reaches production. A scheduled run
+      # has no event, so this is confirmed by the PR's changed files being ALL
+      # under .github/workflows/ or .github/actions/ (workflow/composite-action
+      # definitions) rather than by package name, which keeps it ecosystem-
+      # accurate. Off by default; set to "true" per repo.
+      ALLOW_ACTIONS_MAJOR: "true"
       DRY_RUN: ${{ github.event_name == 'workflow_dispatch' && inputs.dry_run || 'false' }}
     steps:
       - name: Sweep open Dependabot PRs
@@ -174,6 +181,31 @@ jobs:
               held=$((held+1)); continue
             fi
 
+            # github-actions major override: a bump that touches ONLY workflow or
+            # composite-action DEFINITION files runs in CI and never ships. When
+            # enabled for this repo, clear a hold:major (but NOT a hold:zerover or
+            # hold:unparseable) for such a PR. The allowlist is a .yml/.yaml file
+            # under .github/workflows/ or .github/actions/, and the extension
+            # check matters: a non-actions ecosystem can keep a manifest under
+            # those dirs (this repo has .github/actions/run-task/package-lock.json),
+            # and a path-prefix-only match would merge an npm major touching it as
+            # if it were a CI-only action bump. Pull a flat filename list across
+            # pages and count the non-action files in the shell; gh rejects --slurp
+            # together with --jq, so do NOT reach for it here. An empty or failed
+            # response leaves the PR held.
+            if [ "$ALLOW_ACTIONS_MAJOR" = "true" ] && [ "${verdict%% *}" = "hold:major" ]; then
+              changed=$(gh api "repos/$REPO/pulls/$n/files" --paginate --jq '.[].filename' 2>/dev/null)
+              if [ -z "$changed" ]; then
+                non_actions="unknown"
+              else
+                non_actions=$(printf '%s\n' "$changed" | grep -vcE '^\.github/(workflows|actions)/.*\.(ya?ml)$')
+              fi
+              if [ "$non_actions" = "0" ]; then
+                echo "OVERRIDE #$n (actions-only major; CI-gated by nature) $title"
+                verdict="merge"
+              fi
+            fi
+
             if [ "${verdict%%:*}" != "merge" ]; then
               echo "HOLD    #$n ($verdict) $title"
               held=$((held+1))
@@ -256,9 +288,14 @@ jobs:
                 fi
                 ok=true; break
               fi
-              # Retry ONLY the transient base-moved race, same rule as the
-              # per-PR workflow. A real conflict will never clear by waiting.
-              if echo "$out" | grep -q "Base branch was modified"; then
+              # Retry the transient races, same rule as the per-PR workflow: the
+              # base-moved race, and the window where a ruleset's auto-requested
+              # review (e.g. Copilot review on push) is still pending ("base
+              # branch policy prohibits the merge"). A genuinely-failing required
+              # check reports the same string and will not clear, so the bounded
+              # backoff just expires and the next sweep retries. A real conflict
+              # is never retried.
+              if echo "$out" | grep -qE "Base branch was modified|base branch policy prohibits the merge"; then
                 sleep $((attempt * 10)); continue
               fi
               echo "FAILED  #$n $title"
