@@ -3,7 +3,9 @@
 # no required checks to gate on.
 #
 # Patch/minor Dependabot PRs merge IMMEDIATELY on arrival, with NO verification.
-# Majors are held for a human. This is a deliberate trade for low-blast-radius
+# Majors are held for a human, EXCEPT github-actions majors when
+# ALLOW_ACTIONS_MAJOR is set (those run only in CI; see the classify step).
+# This is a deliberate trade for low-blast-radius
 # internal tooling only. Do NOT use on anything deployed or customer-facing.
 # Add a README line on the repo noting bumps merge without CI, on purpose.
 #
@@ -58,13 +60,31 @@ jobs:
           # there is no runtime surface to break. Off by default; set to "true"
           # per repo (see runbook section 6). Non-actions majors are unaffected.
           ALLOW_ACTIONS_MAJOR: "true"
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPO: ${{ github.repository }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
         run: |
           merge=false
           # github-actions bumps only affect CI; when enabled for this repo a
           # major is safe because CI catches a broken action before it ships.
           actions_major_ok=false
           if [[ "$ALLOW_ACTIONS_MAJOR" == "true" && ( "$ECO" == "github_actions" || "$ECO" == "github-actions" ) ]]; then
-            actions_major_ok=true
+            # A major is a bigger change than a patch/minor, so for the actions
+            # override also apply the sweeper's non-bot guard: the author gate
+            # stays dependabot[bot] even if a human pushes a commit to the branch,
+            # and this immediate path would otherwise merge those human changes.
+            # Count non-Dependabot commits across all pages; an unreadable commit
+            # list (empty -> "unknown") fails safe and holds.
+            # Capture the commit list with its exit status (awk as the last
+            # pipe element would otherwise mask a mid-pagination gh failure and
+            # yield 0); any gh failure -> "unknown" -> hold.
+            if commits=$(gh api "repos/${REPO}/pulls/${PR_NUMBER}/commits" --paginate \
+                           --jq '[.[] | select((.author.login != "dependabot[bot]") or (.committer.login != "dependabot[bot]"))] | length' 2>/dev/null); then
+              nonbot=$(printf '%s\n' "$commits" | awk '{s+=$1} END{print (NR?s:"unknown")}')
+            else
+              nonbot="unknown"
+            fi
+            [[ "$nonbot" == "0" ]] && actions_major_ok=true
           fi
           case "$UT" in
             version-update:semver-patch|version-update:semver-minor) merge=true ;;
@@ -90,10 +110,17 @@ jobs:
         if: steps.bump.outputs.merge == 'true'
         env:
           PR_URL: ${{ github.event.pull_request.html_url }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
+          # --match-head-commit pins the merge to the exact commit this run
+          # classified. A commit pushed into the race window between the classify
+          # step's non-bot check and here cannot ride the merge: the head no
+          # longer matches, the merge is refused, and that push has already
+          # spawned a fresh run that re-evaluates. A head mismatch is a
+          # non-transient failure below (not retried), which is correct.
           for attempt in 1 2 3 4 5; do
-            if out=$(gh pr merge --squash "$PR_URL" 2>&1); then
+            if out=$(gh pr merge --squash --match-head-commit "$HEAD_SHA" "$PR_URL" 2>&1); then
               echo "merged on attempt $attempt"; exit 0
             fi
             echo "attempt $attempt failed: $out"
