@@ -51,20 +51,40 @@ jobs:
         id: bump
         env:
           UT: ${{ steps.meta.outputs.update-type }}
+          ECO: ${{ steps.meta.outputs.package-ecosystem }}
           TITLE: ${{ github.event.pull_request.title }}
+          # Also auto-merge github-actions MAJOR bumps. Action bumps run only in
+          # CI, so a broken one fails the build and never reaches production;
+          # there is no runtime surface to break. Off by default; set to "true"
+          # per repo (see runbook section 6). Non-actions majors are unaffected.
+          ALLOW_ACTIONS_MAJOR: "true"
         run: |
           merge=false
+          # github-actions bumps only affect CI; when enabled for this repo a
+          # major is safe because CI catches a broken action before it ships.
+          actions_major_ok=false
+          if [[ "$ALLOW_ACTIONS_MAJOR" == "true" && ( "$ECO" == "github_actions" || "$ECO" == "github-actions" ) ]]; then
+            actions_major_ok=true
+          fi
           case "$UT" in
             version-update:semver-patch|version-update:semver-minor) merge=true ;;
-            version-update:semver-major) merge=false ;;
+            version-update:semver-major)
+              [[ "$actions_major_ok" == "true" ]] && merge=true ;;
             *)
+              # No update-type (e.g. ">=" requirement update). Parse the title.
+              # Require an actual version pair: an unparseable PR must hold, even
+              # for actions, rather than merge blind.
               if [[ "$TITLE" =~ from[[:space:]]+[^0-9]*([0-9][0-9A-Za-z.-]*)[[:space:]]+to[[:space:]]+[^0-9]*([0-9][0-9A-Za-z.-]*) ]]; then
                 old="${BASH_REMATCH[1]}"; new="${BASH_REMATCH[2]}"
-                [[ "${old%%.*}" == "${new%%.*}" ]] && merge=true
+                if [[ "${old%%.*}" == "${new%%.*}" ]]; then
+                  merge=true                        # same major: patch/minor
+                elif [[ "$actions_major_ok" == "true" ]]; then
+                  merge=true                        # different major, but actions is CI-only
+                fi
               fi ;;
           esac
           echo "merge=$merge" >> "$GITHUB_OUTPUT"
-          echo "update-type='$UT' title='$TITLE' -> merge=$merge"
+          echo "update-type='$UT' eco='$ECO' actions_major_ok=$actions_major_ok title='$TITLE' -> merge=$merge"
 
       - name: Merge patch/minor immediately (retry only on base-moved race)
         if: steps.bump.outputs.merge == 'true'
@@ -77,10 +97,16 @@ jobs:
               echo "merged on attempt $attempt"; exit 0
             fi
             echo "attempt $attempt failed: $out"
-            # Retry ONLY the transient base-moved race. Anything else (e.g. a
-            # real "cannot be cleanly created" conflict) will never clear by
-            # waiting, so fail fast instead of burning the backoff.
-            if echo "$out" | grep -q "Base branch was modified"; then
+            # Retry the transient races. Two clear by waiting:
+            #   - "Base branch was modified": the burst race into a moving main.
+            #   - "base branch policy prohibits the merge": a repo ruleset has an
+            #     auto-requested review (e.g. Copilot review on push) still
+            #     pending; it posts within a minute or two and then the merge
+            #     goes through. A genuinely-failing required check reports the
+            #     same string and will NOT clear, so this just burns the bounded
+            #     backoff and leaves the PR for the sweeper. A real conflict
+            #     ("cannot be cleanly created") is never retried.
+            if echo "$out" | grep -qE "Base branch was modified|base branch policy prohibits the merge"; then
               sleep $((attempt * 10)); continue
             fi
             echo "non-transient failure; not retrying"; exit 1
