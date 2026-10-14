@@ -39,6 +39,8 @@ on:
 permissions:
   contents: write
   pull-requests: write
+  # Read Dependabot's own update-job runs for the failed-update check below.
+  actions: read
 
 # Never let two sweeps run at once, and never let a sweep race the per-PR
 # workflow. Sharing the per-PR group name is deliberate: it means a sweep and
@@ -79,6 +81,12 @@ jobs:
       # definitions) rather than by package name, which keeps it ecosystem-
       # accurate. Off by default; set to "true" per repo.
       ALLOW_ACTIONS_MAJOR: "true"
+      # What to do when Dependabot's own update jobs are failing (see the
+      # "Check Dependabot update jobs" step). "fail" turns the sweep red so the
+      # outage is noticed; "warn" only annotates. Use "warn" solely on a repo
+      # whose failures are known and parked (blog-addons), so the red run keeps
+      # meaning something everywhere else.
+      UPDATE_JOB_CHECK: fail
       DRY_RUN: ${{ github.event_name == 'workflow_dispatch' && inputs.dry_run || 'false' }}
     steps:
       - name: Sweep open Dependabot PRs
@@ -180,6 +188,35 @@ jobs:
             fi
           }
 
+          # Ask Dependabot to rebase a conflicted PR. Dependabot rebases its own
+          # PRs automatically, but STOPS once a PR is 30 days old, so anything
+          # that sat held or unmerged for a month goes `dirty` and never moves
+          # again (reverb-taxonomy had 10 such PRs, oldest from 2023). A rebase
+          # either refreshes the PR so it can merge, or makes Dependabot close it
+          # as superseded, which is the right outcome for stale duplicates.
+          # Rate-limited to one nudge per PR per 7 days, keyed on any existing
+          # "@dependabot rebase" comment, so a PR Dependabot cannot rebase (it
+          # replies explaining why) is not spammed every 6 hours.
+          nudged=0
+          nudge() {
+            local n="$1" recent since
+            since=$(date -u -d '7 days ago' +%Y-%m-%dT%H:%M:%SZ)
+            # --paginate emits one count per page; sum them. (gh's --jq has no
+            # --arg, so the timestamp is interpolated; it is our own date output.)
+            recent=$(gh api "repos/$REPO/issues/$n/comments" --paginate \
+                       --jq "[.[] | select((.body | test(\"^@dependabot (rebase|recreate)\")) and .created_at >= \"$since\")] | length" 2>/dev/null \
+                     | awk '{s+=$1} END{print s+0}')
+            [ "$recent" = "0" ] || { echo "        #$n already nudged in the last 7 days"; return 0; }
+            if [ "$DRY_RUN" = "true" ]; then
+              echo "WOULD NUDGE #$n (@dependabot rebase)"; return 0
+            fi
+            if gh pr comment "$n" --repo "$REPO" --body "@dependabot rebase" >/dev/null 2>&1; then
+              echo "NUDGED  #$n (@dependabot rebase)"; nudged=$((nudged+1))
+            else
+              echo "        #$n nudge comment failed (non-fatal)"
+            fi
+          }
+
           for n in $prs; do
             title=$(gh api "repos/$REPO/pulls/$n" --jq '.title')
             # Capture the head SHA now and pin the merge to it below, so the
@@ -208,8 +245,14 @@ jobs:
             # not authored by Dependabot, a human has touched it. Hold it for
             # review regardless of how the versions classify — the classifier
             # only reads version numbers and cannot vouch for arbitrary code.
+            # Dependabot's commits are signed by GitHub, so their COMMITTER is
+            # `web-flow`, not dependabot[bot]. Requiring committer==dependabot[bot]
+            # (as #8 did) held every genuine PR and disabled this sweeper
+            # fleet-wide for 8 days. Accept dependabot[bot] or web-flow, and
+            # require a verified signature; a human pushing a commit with a
+            # spoofed author still shows as committer=<their login> and holds.
             non_bot=$(gh api "repos/$REPO/pulls/$n/commits" --paginate \
-                        --jq '[.[] | select((.author.login != "dependabot[bot]") or (.committer.login != "dependabot[bot]"))] | length' 2>/dev/null || echo "unknown")
+                        --jq '[.[] | select((.author.login != "dependabot[bot]") or (([.committer.login] | inside(["dependabot[bot]", "web-flow"])) | not) or (.commit.verification.verified != true))] | length' 2>/dev/null || echo "unknown")
             if [ "$non_bot" != "0" ]; then
               echo "HOLD    #$n (has non-Dependabot commits: $non_bot) $title"
               disarm "$n"
@@ -268,6 +311,14 @@ jobs:
               echo "HOLD    #$n ($verdict) $title"
               disarm "$n"
               held=$((held+1))
+              # Keep held PRs rebased too, so a held major is merge-ready when a
+              # human gets to it, and a superseded one gets closed by Dependabot
+              # instead of lingering. (NOT done for the non-bot-commit hold above:
+              # a rebase there could force-push over a human's commits.) One
+              # unprobed read is enough; `unknown` just waits for the next sweep.
+              if [ "$(gh api "repos/$REPO/pulls/$n" --jq '.mergeable_state' 2>/dev/null)" = "dirty" ]; then
+                nudge "$n"
+              fi
               continue
             fi
 
@@ -297,7 +348,10 @@ jobs:
                 # and that surfaces as a normal non-transient failure.
                 : ;;                     # fine to proceed
               dirty)
-                echo "SKIP    #$n (conflicted; likely superseded, needs closing not merging) $title"
+                # Can't merge as-is. Ask Dependabot to rebase: it either refreshes
+                # the PR (next sweep merges it) or closes it as superseded.
+                echo "SKIP    #$n (conflicted) $title"
+                nudge "$n"
                 skipped=$((skipped+1)); continue ;;
               blocked)
                 # On a CI-gated repo this is the NORMAL state while required
@@ -365,7 +419,50 @@ jobs:
           done
 
           echo
-          echo "sweep summary: merged=$merged held=$held skipped=$skipped failed=$failed (dry_run=$DRY_RUN)"
+          echo "sweep summary: merged=$merged held=$held skipped=$skipped nudged=$nudged failed=$failed (dry_run=$DRY_RUN)"
           # A held PR is a correct outcome, not an error. Only a failed merge
           # attempt should colour the run, and even then the next sweep retries.
           [ "$failed" -eq 0 ]
+
+      # --- Check Dependabot update jobs ---------------------------------------
+      # Everything above only sees PRs. When Dependabot's update job itself
+      # fails, NO PR is ever opened, so there is nothing to sweep and the repo
+      # looks healthy while its alerts sit open indefinitely. Found 2026-10-14:
+      # blog-addons, security-cf-imgdemo and once had failed every security
+      # update since enrollment (manifest caps below the patched version), and
+      # reverb-tracecat's uv security jobs were failing, all unnoticed for weeks.
+      #
+      # Dependabot runs each update as an Actions run with event `dynamic` and a
+      # name like "pip in /. for Pillow - Update #1613810855". Strip the update
+      # number to get a stable key per ecosystem/directory/package set, keep the
+      # latest run for each key, and report any whose latest run FAILED. A key
+      # that later succeeds (e.g. after a manifest fix) clears itself. Window is
+      # 14 days: long enough that an un-retried security job stays visible,
+      # short enough that a key fixed by hand without a re-run ages out.
+      #
+      # Runs even when the sweep step failed, so one outage cannot hide the other.
+      - name: Check Dependabot update jobs
+        if: always()
+        run: |
+          set -uo pipefail
+          since=$(date -u -d '14 days ago' +%Y-%m-%d)
+          if ! runs=$(gh api "repos/$REPO/actions/runs?event=dynamic&created=>=$since&per_page=100" --paginate \
+                  --jq '.workflow_runs[] | select(.name | test(" - Update #[0-9]+$")) | [.created_at, .conclusion // "pending", (.name | sub(" - Update #[0-9]+$"; "")), .html_url] | @tsv'); then
+            echo "::error::Could not list Dependabot update runs for $REPO."
+            exit 1
+          fi
+          # Latest run per key: sort newest first, keep the first line per key.
+          bad=$(printf '%s\n' "$runs" | sort -r | awk -F'\t' 'NF && !seen[$3]++ && $2=="failure"')
+          if [ -z "$bad" ]; then
+            echo "Dependabot update jobs: no failing keys in the last 14 days."
+            exit 0
+          fi
+          level=error; [ "$UPDATE_JOB_CHECK" = "warn" ] && level=warning
+          echo "Dependabot update jobs whose latest run FAILED (no PR will be opened for these):"
+          while IFS=$'\t' read -r at _ key url; do
+            echo "::$level::Dependabot update failing since ${at%%T*}: $key ($url)"
+          done <<< "$bad"
+          echo
+          echo "Fix: open the run log, read the Errors table (usually a manifest cap below"
+          echo "the patched version, or a private registry auth failure), fix the manifest."
+          [ "$UPDATE_JOB_CHECK" = "warn" ]
