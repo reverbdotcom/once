@@ -56,6 +56,8 @@ jobs:
     runs-on: ubuntu-latest
     env:
       GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      # Optional. Posts "@dependabot rebase" on conflicted PRs; see nudge().
+      NUDGE_TOKEN: ${{ secrets.DEPENDABOT_NUDGE_TOKEN }}
       REPO: ${{ github.repository }}
       # Match the per-PR workflow for this repo: "squash" for non-CI repos,
       # "merge" for repos whose ruleset requires merge commits (reverb-tracecat).
@@ -197,9 +199,21 @@ jobs:
           # Rate-limited to one nudge per PR per 7 days, keyed on any existing
           # "@dependabot rebase" comment, so a PR Dependabot cannot rebase (it
           # replies explaining why) is not spammed every 6 hours.
-          nudged=0
+          #
+          # Dependabot only obeys commands from accounts with push access, and
+          # the workflow's GITHUB_TOKEN (github-actions[bot]) does not qualify:
+          # it replies "Sorry, only users with push access can use that command"
+          # (verified 2026-10-14 on 11 PRs). So the comment is posted with the
+          # optional DEPENDABOT_NUDGE_TOKEN secret (a machine account or app with
+          # push access). Without it, conflicted PRs are listed in the run
+          # summary for a human to rebase, and nothing is posted.
+          nudged=0; needs_rebase=""
           nudge() {
             local n="$1" recent since
+            if [ -z "${NUDGE_TOKEN:-}" ]; then
+              echo "        #$n needs '@dependabot rebase' (no DEPENDABOT_NUDGE_TOKEN; not posted)"
+              needs_rebase="$needs_rebase #$n"; return 0
+            fi
             since=$(date -u -d '7 days ago' +%Y-%m-%dT%H:%M:%SZ)
             # --paginate emits one count per page; sum them. (gh's --jq has no
             # --arg, so the timestamp is interpolated; it is our own date output.)
@@ -210,7 +224,7 @@ jobs:
             if [ "$DRY_RUN" = "true" ]; then
               echo "WOULD NUDGE #$n (@dependabot rebase)"; return 0
             fi
-            if gh pr comment "$n" --repo "$REPO" --body "@dependabot rebase" >/dev/null 2>&1; then
+            if GH_TOKEN="$NUDGE_TOKEN" gh pr comment "$n" --repo "$REPO" --body "@dependabot rebase" >/dev/null 2>&1; then
               echo "NUDGED  #$n (@dependabot rebase)"; nudged=$((nudged+1))
             else
               echo "        #$n nudge comment failed (non-fatal)"
@@ -420,6 +434,10 @@ jobs:
 
           echo
           echo "sweep summary: merged=$merged held=$held skipped=$skipped nudged=$nudged failed=$failed (dry_run=$DRY_RUN)"
+          if [ -n "$needs_rebase" ]; then
+            # Annotation so it shows on the run page, not just in the log.
+            echo "::warning::Conflicted Dependabot PRs need '@dependabot rebase' from someone with push access:$needs_rebase"
+          fi
           # A held PR is a correct outcome, not an error. Only a failed merge
           # attempt should colour the run, and even then the next sweep retries.
           [ "$failed" -eq 0 ]
