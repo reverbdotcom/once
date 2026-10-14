@@ -79,7 +79,7 @@ jobs:
             # pipe element would otherwise mask a mid-pagination gh failure and
             # yield 0); any gh failure -> "unknown" -> hold.
             if commits=$(gh api "repos/${REPO}/pulls/${PR_NUMBER}/commits" --paginate \
-                           --jq '[.[] | select((.author.login != "dependabot[bot]") or (.committer.login != "dependabot[bot]"))] | length' 2>/dev/null); then
+                           --jq '[.[] | select((.author.login != "dependabot[bot]") or (([.committer.login] | inside(["dependabot[bot]", "web-flow"])) | not) or (.commit.verification.verified != true))] | length' 2>/dev/null); then
               nonbot=$(printf '%s\n' "$commits" | awk '{s+=$1} END{print (NR?s:"unknown")}')
             else
               nonbot="unknown"
