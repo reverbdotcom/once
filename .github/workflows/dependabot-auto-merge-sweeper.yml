@@ -41,6 +41,9 @@ permissions:
   pull-requests: write
   # Read Dependabot's own update-job runs for the failed-update check below.
   actions: read
+  # Read PR comment history for the rebase-nudge rate limit. A failed read
+  # skips the nudge, so this must not depend on pull-requests implying it.
+  issues: read
 
 # Never let two sweeps run at once, and never let a sweep race the per-PR
 # workflow. Sharing the per-PR group name is deliberate: it means a sweep and
@@ -209,7 +212,7 @@ jobs:
           # summary for a human to rebase, and nothing is posted.
           nudged=0; needs_rebase=""
           nudge() {
-            local n="$1" recent since
+            local n="$1" recent since pages cur_head
             if [ -z "${NUDGE_TOKEN:-}" ]; then
               echo "        #$n needs '@dependabot rebase' (no DEPENDABOT_NUDGE_TOKEN; not posted)"
               needs_rebase="$needs_rebase #$n"; return 0
@@ -217,17 +220,31 @@ jobs:
             since=$(date -u -d '7 days ago' +%Y-%m-%dT%H:%M:%SZ)
             # --paginate emits one count per page; sum them. (gh's --jq has no
             # --arg, so the timestamp is interpolated; it is our own date output.)
-            recent=$(gh api "repos/$REPO/issues/$n/comments" --paginate \
-                       --jq "[.[] | select((.body | test(\"^@dependabot (rebase|recreate)\")) and .created_at >= \"$since\")] | length" 2>/dev/null \
-                     | awk '{s+=$1} END{print s+0}')
+            # If the comment history can't be read, skip: posting blind would
+            # bypass the rate limit every 6 hours for as long as the API fails.
+            if ! pages=$(gh api "repos/$REPO/issues/$n/comments" --paginate \
+                       --jq "[.[] | select((.body | test(\"^@dependabot (rebase|recreate)\")) and .created_at >= \"$since\")] | length" 2>/dev/null); then
+              echo "        #$n could not read comments; listed for manual rebase"
+              needs_rebase="$needs_rebase #$n"; return 0
+            fi
+            recent=$(printf '%s\n' "$pages" | awk '{s+=$1} END{print s+0}')
             [ "$recent" = "0" ] || { echo "        #$n already nudged in the last 7 days"; return 0; }
+            # The non-bot commit check ran against $head_sha. If the head moved
+            # since (e.g. a human pushed), don't ask for a rebase on commits we
+            # never vetted; the next sweep re-evaluates from scratch.
+            cur_head=$(gh api "repos/$REPO/pulls/$n" --jq '.head.sha' 2>/dev/null || echo "")
+            if [ "$cur_head" != "$head_sha" ]; then
+              echo "        #$n head changed since vetting; not nudging"; return 0
+            fi
             if [ "$DRY_RUN" = "true" ]; then
               echo "WOULD NUDGE #$n (@dependabot rebase)"; return 0
             fi
             if GH_TOKEN="$NUDGE_TOKEN" gh pr comment "$n" --repo "$REPO" --body "@dependabot rebase" >/dev/null 2>&1; then
               echo "NUDGED  #$n (@dependabot rebase)"; nudged=$((nudged+1))
             else
-              echo "        #$n nudge comment failed (non-fatal)"
+              # Surface it in the run warning so a human rebases it by hand.
+              echo "        #$n nudge comment failed; listed for manual rebase"
+              needs_rebase="$needs_rebase #$n"
             fi
           }
 
@@ -265,8 +282,14 @@ jobs:
             # fleet-wide for 8 days. Accept dependabot[bot] or web-flow, and
             # require a verified signature; a human pushing a commit with a
             # spoofed author still shows as committer=<their login> and holds.
-            non_bot=$(gh api "repos/$REPO/pulls/$n/commits" --paginate \
-                        --jq '[.[] | select((.author.login != "dependabot[bot]") or (([.committer.login] | inside(["dependabot[bot]", "web-flow"])) | not) or (.commit.verification.verified != true))] | length' 2>/dev/null || echo "unknown")
+            # --paginate emits one count per page; sum them, as the per-PR
+            # templates do. Any gh failure -> "unknown" -> hold.
+            if pages=$(gh api "repos/$REPO/pulls/$n/commits" --paginate \
+                        --jq '[.[] | select((.author.login != "dependabot[bot]") or ((.committer.login | IN("dependabot[bot]", "web-flow")) | not) or (.commit.verification.verified != true))] | length' 2>/dev/null); then
+              non_bot=$(printf '%s\n' "$pages" | awk '{s+=$1} END{print (NR?s:"unknown")}')
+            else
+              non_bot="unknown"
+            fi
             if [ "$non_bot" != "0" ]; then
               echo "HOLD    #$n (has non-Dependabot commits: $non_bot) $title"
               disarm "$n"
@@ -470,15 +493,18 @@ jobs:
             exit 1
           fi
           # Latest run per key: sort newest first, keep the first line per key.
-          bad=$(printf '%s\n' "$runs" | sort -r | awk -F'\t' 'NF && !seen[$3]++ && $2=="failure"')
+          # Alarm on any unsuccessful terminal conclusion (failure, timed_out,
+          # startup_failure, cancelled, action_required, stale): none of them
+          # opened a PR. Success, skipped, neutral and still-running are fine.
+          bad=$(printf '%s\n' "$runs" | sort -r | awk -F'\t' 'NF && !seen[$3]++ && $2!~/^(success|skipped|neutral|pending)$/')
           if [ -z "$bad" ]; then
             echo "Dependabot update jobs: no failing keys in the last 14 days."
             exit 0
           fi
           level=error; [ "$UPDATE_JOB_CHECK" = "warn" ] && level=warning
-          echo "Dependabot update jobs whose latest run FAILED (no PR will be opened for these):"
-          while IFS=$'\t' read -r at _ key url; do
-            echo "::$level::Dependabot update failing since ${at%%T*}: $key ($url)"
+          echo "Dependabot update jobs whose latest run did not succeed (no PR will be opened for these):"
+          while IFS=$'\t' read -r at concl key url; do
+            echo "::$level::Dependabot update $concl since ${at%%T*}: $key ($url)"
           done <<< "$bad"
           echo
           echo "Fix: open the run log, read the Errors table (usually a manifest cap below"
